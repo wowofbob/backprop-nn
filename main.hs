@@ -17,6 +17,7 @@ sigmoid p x = 1 / ( 1 + exp ((-x)/p) )
 subs :: Num a => a -> a -> a
 subs x y = y - x
 
+pair = (,)
 -------
 
 newtype Channel a = Channel { recv :: a }
@@ -35,56 +36,97 @@ instance Functor Channel where
   fmap f (Channel s) = Channel $ f s
 
 
--- Neuron holds only his weights and threshold value
+---------------------
+-- Network   
+
+newtype Arch = Arch { archToList :: [Int] }
+
+nullArch (Arch xs) = null xs
+
 data Neuron w =
   Neuron { weights   :: [w]
          , threshold :: w }
+          deriving Show
+         
+type Activation  a = a -> a -- activation
+type Activation' a = a -> a -- it's derivation
+         
+newtype Layer w = Layer { neurons :: [Neuron w] }
+  deriving Show
 
--- Activation must be smooth function from one argument
-type Activation a = a -> a
--- Activator is a pair from such function and a channels to receive inputs
-type Activator a = (Activation a, [Channel a])
-
--- Forces neuron to send response on given activator
-activate :: Num a => Activator a -> Neuron a -> Channel a
-activate (f, cs) n =
-  sequence cs >>= return . f . subs (threshold n) . dotProd (weights n)
+-- back propagation network
+data BPNetwork a =
+  BPNetwork { arch      :: Arch                -- network architecture
+            , act       :: Activation  a       -- neuron activation
+            , act'      :: Activation' a       -- neuron activation derivative
+            , layers    :: [Layer a]           -- layers of neurons
+            , lrate     :: a }                 -- learning rate
+            
+            
+type Activator a = (Activation a, [a])
+            
+activate :: Num a => Activator a -> Neuron a -> a
+activate (f, is) =
+  f . getSum is
   
-------------------------------------------
--- Netwok --
-{-
-  I wanted to experiment with Vectors and Matrixes
-  and see how these immutable structurse may influe
-  on overal project here.
--}
+getSum :: Num a => [a] -> Neuron a -> a
+getSum is n = weights n `dotProd` is - threshold n
+            
+            
+actLayer :: Num a => Activator a -> Layer a -> [a]
+actLayer a l = neurons l >>= return . activate a
+            
+runBPNetwork :: Num a => BPNetwork a -> [a] -> [a]
+runBPNetwork net inp =
+  foldl (\ is lr -> actLayer (actF, is) lr) inp (layers net)
+    where
+      actF = act net
 
-
--- Id's are for implementation. They won't
--- be used by user (i think).
-newtype LayerId   = LayerId Int
-newtype NeuronId  = NeuronId Int
-newtype ChannelId = ChannelId Int
-
--- Node of network:
--- input channels, output channel and processor
-data Node w =
-  Node { input  :: [ChannelId]
-       , output :: ChannelId
-       , proc   :: Neuron w }
-
--- Layer just stores neurons
-newtype Layer w = Layer { units :: DV.Vector (Node w) }
-
--- Network consists from layers which comes in order
--- and channels matrix. Neurons reads out and writes
--- in there. Here, rows refers to LayerId's. Cols refers
--- to ChannelId's.
-data Network a =
-  Network { layers   :: DV.Vector (Layer a)
-          , channels :: DM.Matrix (Channel a) }
+genBPNetwork :: Num a => Arch -> Activation a -> Activation' a -> a -> BPNetwork a
+genBPNetwork netArch actF actF' lr
+  | nullArch netArch = error "Given Architecture is undefined"
+  | otherwise =
+    BPNetwork netArch actF actF' genLayers lr
+    where
+      
+      inpLayerLen = head $ archToList netArch
+      
+      -- samples 
+      sampleWeight = 1
+      sampleThresh = 1
+      
+      sampleNeuron wLen =
+        Neuron (replicate wLen sampleWeight) sampleThresh  
+      
+      sampleLayer predLen thisLen =
+        Layer $ replicate thisLen $ sampleNeuron predLen
+      
+      -- layers generator
+      genLayers =
+        reverse $ snd $ foldl (\ (predLen, ls) thisLen ->
+                (thisLen, sampleLayer predLen thisLen : ls)) (inpLayerLen, []) $
+                  tail $ archToList netArch
+                  
+                  
+-- training
+--train :: Num a => BPNetwork a -> ([a], [a]) -> BPNetwork a
+train net (inputs, correctOutputs) = go inputs (layers net)
+  where
+  
+    actF' = act' net
+    actF  = act  net
+    nrate = negate $ lrate net
+    
+    
+    go inputs [lastLayer] =
+      let (sums, outs) = unzip $ map (\ n -> let
+                                        s = getSum inputs n
+                                        o = actF s
+                                        in (s, o)) $ neurons lastLayer
+          -- верно :
+          deltas = zipWith (*) (map actF' sums) (zipWith (-) outs correctOutputs)
           
--- Constant for id of input layer.
-inputLayerId :: LayerId
-inputLayerId = LayerId (-1)         
- 
-
+          dWs    = map (\ d -> map (*(nrate * d)) inputs) deltas
+      in dWs
+      
+    updateWeights dWs = undefined
