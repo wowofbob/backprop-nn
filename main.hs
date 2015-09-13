@@ -7,7 +7,7 @@
 import Foreign.Storable
 import Numeric.LinearAlgebra.Data
 import Numeric.LinearAlgebra.HMatrix
-import Numeric.LinearAlgebra
+import Numeric.LinearAlgebra hiding ((<>))
 
 import Data.List
 
@@ -39,305 +39,350 @@ indent :: Int -> String -> String
 indent spaceSize =
   let space = replicate spaceSize ' '
     in init . unlines . map (space++) . lines
+    
+showLayers :: Show a => [a] -> String
+showLayers = intercalate "\n" .
+               map (\ (i, x) ->
+                 "Layer " ++ show i ++ ":\n" ++ indent indSz (show x)
+                 ) . zip [1..] 
+  where
+    indSz = 4
+    
+ntimes n f = foldr (.) id (replicate n f)
 -------
 
-newtype Channel a = Channel { recv :: a }
-  deriving Show
-send :: a -> Channel a
-send = Channel
+{-
+  There are a three stages of neural network working:
+  
+  1) (not formal) to construct network
+  2) to propagate input forward
+  3) to propagate error backward
+-}
 
-instance Monad Channel where
-  c >>= f = f $ recv c 
+-----------------------------------------------------
+-- Stage 1. Construction.
 
-instance Applicative Channel where
-  pure    = send
-  (<*>) f = fmap (recv f) 
-
-instance Functor Channel where
-  fmap f (Channel s) = Channel $ f s
-
-
----------------------
--- Network construction.
-
--- Data type to hold both activation
--- function and it's derivative.
+-- Neuron's activation
 data ActivationSpec a =
-  ActivationSpec { actF  :: a -> a   -- activation function
-                 , actF' :: a -> a   -- it's derivative
-                 , desc  :: String } -- description
-                 
+  ActivationSpec { asFunc  :: a -> a   -- activation function
+                 , asFunc' :: a -> a   -- it's derivative
+                 , asDesc  :: String } -- description
+
 instance Show (ActivationSpec a) where
-  show = desc
-           
--- Example of ActivationSpec for sigmoid function
-sigmoidActSpec =
-  ActivationSpec { actF  = sigmoid
-                 , actF' = sigmoid'
-                 , desc  = "Sigmoid activation function" }
+  show = asDesc
 
--- Type for layer. Each layer may have
--- it's own activation function.
--- Neurons are represented by matrix
--- which rows are inputs and cols
--- are neurons. So, element on i'th
--- row and j'th column is a weight of
--- j'th neuron for i'th input.      
+-- Network Layer
 data Layer a =
-  Layer { layerWeights :: Matrix a
-        , layerActSpec :: ActivationSpec a }
+  Layer { lWs :: Matrix a           -- layer weights
+        , lAS :: ActivationSpec a } -- layer activation (one activation for each neuron per layer)
 
-instance (Show a, Storable a, Element a) => Show (Layer a) where
-  show lr = "Weights: " ++ show (layerWeights lr) ++
-            "\nActivation: " ++ show (layerActSpec lr) 
-     
--- I decided to not keep learning rate value
--- with network. So this type only holds
--- network's layers ordered from 1'th
--- to last (output) layer.   
-newtype Network a =
-  Network { networkLayers :: [Layer a] }
-  
-instance (Show a, Storable a, Element a) => Show (Network a) where
-  show (Network ls) = "Neural Network\n" ++
-    (intercalate "\n" $
-      map (\ (i, lr) ->
-      "Layer " ++ show i ++ ":\n"
-        ++ (indent indSize $ show lr)) (zip [1..] ls))
-    where
-      indSize = 4  
-  
--- Number of neurons in layer. Auxiliary
--- data which describes a layer structure.
-newtype LayerArch =
-  LayerArch   { laNeuronNumber :: Int }
-
--- Layer's parameter which describes a layer.
--- Having this parameters and architecture
--- of input which this layer should accept,
--- one can can construct actual Layer.
-data LayerParams a =
-  LayerParams { lpLayerArch :: LayerArch
-              , lpDefWeight :: a
-              , lpActSpec   :: ActivationSpec a }
-
--- Layer may be constructed by it's input layer architecture
--- and parameters
-initLayer :: Storable a => LayerArch -> LayerParams a -> Layer a
-initLayer inputArch (LayerParams thisArch defWeight actSpec)  =
-  let weights = (><)
-        (laNeuronNumber inputArch)
-        (laNeuronNumber thisArch) $
-        repeat defWeight
-        in Layer weights actSpec
-      
--- Constructs a network by given input layer architecture
--- and parameters for each layer
-initNetwork :: Storable a => LayerArch -> [LayerParams a] -> Network a
-initNetwork inputArch params
-  | null params = error "Network must have at least one layer"
-  | otherwise =
-    Network $ map (uncurry initLayer) $
-      (inputArch, head params) : (map lpLayerArch params) `zip` (tail params)
-
-
-------------------------------------------------------------------------------
--- Network propagation
-
--- To get network's output, one should
--- propagate network's input throught
--- all levels. We'll describe it as
--- new data type.
-data PropagatedLayer a =
-    SensorLayer { pLayerOutput  :: Vector a }
-  | PropedLayer { pLayerInput   :: Vector a
-                , pLayerOutput  :: Vector a
-                , pLayerActF's  :: Vector a
-                , pLayerWeights :: Matrix a
-                , pLayerActSpec :: ActivationSpec a }
-                
-instance (Show a, Storable a, Element a) => Show (PropagatedLayer a) where
-  show (SensorLayer output) =
-    "Sensor layer: " ++ show output
-  show (PropedLayer inp out f's ws as) =
-    "Input:  " ++ show inp ++ "\n" ++
-    "Output: " ++ show out ++ "\n" ++
-    "F's:    " ++ show f's ++ "\n" ++
-    "Weights: " ++ show ws ++ "\n" ++
-    "Activation: " ++ desc as
-
-                
-propagateLayer :: Numeric a => PropagatedLayer a -> Layer a -> PropagatedLayer a
-propagateLayer pl lr =
-  PropedLayer { pLayerInput   = plOs
-              , pLayerOutput  = lrFs
-              , pLayerActF's  = lrF's
-              , pLayerWeights = lrWs
-              , pLayerActSpec = lrActSpec }
-              where
-                
-                lrWs = layerWeights lr
-                plOs = pLayerOutput pl
-                
-                lrActSpec = layerActSpec lr
-                lrActF    = actF  lrActSpec
-                lrActF'   = actF' lrActSpec
-                
-                lrSumS = trans lrWs #> plOs
-                lrFs   = mapVector lrActF  lrSumS
-                lrF's  = mapVector lrActF' lrSumS
-                
-newtype PropagatedNetwork a =
-  PropagatedNetwork { pNetworkLayers :: [PropagatedLayer a] }
-  
-instance (Show a, Storable a, Element a) => Show (PropagatedNetwork a) where
-  show (PropagatedNetwork ls) = "Propagated Neural Network\n" ++
-    (intercalate "\n" $
-      map (\ (i, lr) ->
-      "Layer " ++ show i ++ ":\n"
-        ++ (indent indSize $ show lr)) (zip [1..] ls))
-    where
-      indSize = 4
-  
-propagateNetwork :: Numeric a => PropagatedLayer a -> Network a -> PropagatedNetwork a
-propagateNetwork inputLayer = PropagatedNetwork .
-  tail . scanl propagateLayer inputLayer . networkLayers
-
------------------------------------------------------------------
--- Network backward propagation
-
-data BackPropedLayer a =
-  BackPropedLayer { bpLayerInput   :: Vector a
-                  , bpLayerOutput  :: Vector a
-                  , bpLayerDeltas  :: Vector a
-                  , bpLayerGrad    :: Matrix a
-                  , bpLayerWeights :: Matrix a
-                  , bpLayerActSpec :: ActivationSpec a }
-                  
-backPropOutputLayer :: (Show a, Numeric a, Num a, Num (Vector a)) =>
-  PropagatedLayer a -> Vector a -> BackPropedLayer a
-backPropOutputLayer outputLayer desiredOutput =
-  BackPropedLayer { bpLayerInput   = is
-                  , bpLayerOutput  = os
-                  , bpLayerDeltas  = ds
-                  , bpLayerGrad    = gr
-                  , bpLayerWeights = ws
-                  , bpLayerActSpec = pLayerActSpec outputLayer }
-                  where
-                    is = pLayerInput outputLayer
-                    os = pLayerOutput outputLayer
-                    ws = pLayerWeights outputLayer
-                    ds = (os - desiredOutput) * pLayerActF's outputLayer
-                    gr = errorGrad (rows ws, cols ws) is ds
-
-errorGrad (r, c) inputs deltas = let
-          lIs = toList inputs
-          lDs = toList deltas
-          in (r><c) $ concat $ map (zipWith (*) lDs . replicate c) lIs 
-          
-          --concatMap (\ d -> map (*d) lIs) lDs
-                      
-backPropHiddenLayer :: (Show a, Numeric a, Num a, Num (Vector a)) =>
-  PropagatedLayer a -> BackPropedLayer a -> BackPropedLayer a
-backPropHiddenLayer thisLayer nextLayer =
-  BackPropedLayer { bpLayerInput   = is
-                  , bpLayerOutput  = os
-                  , bpLayerDeltas  = ds
-                  , bpLayerGrad    = gr
-                  , bpLayerWeights = ws
-                  , bpLayerActSpec = pLayerActSpec thisLayer }
-                  where
-                    ws = pLayerWeights thisLayer
-                    is = pLayerInput thisLayer
-                    os = pLayerOutput thisLayer
-                    ds = (bpLayerWeights nextLayer #> bpLayerDeltas nextLayer) * pLayerActF's thisLayer
-                    gr = errorGrad (rows ws, cols ws) is ds
-                    
-newtype BackPropedNetwork a =
-  BackPropedNetwork { bpNetworkLayers :: [BackPropedLayer a] }
-                    
-backPropNetwork :: (Show a, Numeric a, Num a, Num (Vector a)) =>
-  Vector a -> PropagatedNetwork a -> BackPropedNetwork a
-backPropNetwork desiredOutput (PropagatedNetwork pLs) =
-  let
-    bpOutputLayer = backPropOutputLayer (last pLs) desiredOutput
-    in BackPropedNetwork $ scanr backPropHiddenLayer bpOutputLayer $ init pLs
+instance (Show a, Element a) => Show (Layer a) where
+  show (Layer ws as) =
+    "Weights: " ++ show ws ++ "\nActivation: " ++ show as
     
-----------------------------------------------------------------------------------
--- Updating weights
+-- Network
+newtype Network a =
+  Network { nLs :: [Layer a] }
+  
+instance (Show a, Element a) => Show (Network a) where
+  show = (++) "Network\n" . showLayers . nLs
+  
+-- Assembling
+newtype LayerSize = LayerSize { lsVal :: Int } -- number of neurons
 
-updateLayer :: (Numeric a, Num a, Num (Vector a)) => a -> BackPropedLayer a -> Layer a
-updateLayer rate bpLayer =
-  let ws = bpLayerWeights bpLayer - rate `scale` bpLayerGrad bpLayer
-    in Layer { layerWeights = ws
-             , layerActSpec = bpLayerActSpec bpLayer }
-             
-updateNetwork :: (Numeric a, Num a, Num (Vector a)) => a -> BackPropedNetwork a -> Network a
-updateNetwork rate = Network . map (updateLayer rate) . bpNetworkLayers 
+data LayerParams a =
+  LayerParams { lpSz :: LayerSize
+              , lpW  :: a
+              , lpAS :: ActivationSpec a }
+              
+initLayer :: (Storable a) => LayerSize -> LayerParams a -> Layer a
+initLayer inputSize params =
+  let
+    r  = lsVal inputSize
+    c  = lsVal $ lpSz params
+    ws = (r><c) $ repeat $ lpW params
+    as = lpAS params
+    in Layer ws as
+    
+initNetwork :: (Storable a) => LayerSize -> [LayerParams a] -> Network a
+initNetwork inputSize params =
+  Network $ map (uncurry initLayer) $
+    (inputSize, head params) : (map lpSz params) `zip` tail params
+    
+    
+-----------------------------------------------------
+-- Stage 2. Forward Propagation.
 
------------------------------------------------------------------------------------
--- Training
+data PropedLayer a =
+    SensorLayer { plOutput :: Vector a }
+    
+  | PropedLayer { plInput  :: Vector a
+                , plOutput :: Vector a
+                , plF's    :: Vector a
+                , plWs     :: Matrix a
+                , plAS     :: ActivationSpec a }
+                
 
-sensorLayer :: Vector a -> PropagatedLayer a
-sensorLayer outputs = SensorLayer outputs
+instance (Show a, Element a) => Show (PropedLayer a) where
+  show (SensorLayer out) =
+    "SensorLayer: " ++ show out
+  show (PropedLayer inp out f's ws as) =
+    "Input:  "     ++ show inp ++ "\n" ++
+    "Output: "     ++ show out ++ "\n" ++
+    "F's:    "     ++ show f's ++ "\n" ++
+    "Weights: "    ++ show ws  ++ "\n" ++
+    "Activation: " ++ show as
+   
+newtype PropedNetwork a =
+  PropedNetwork { pnLs :: [PropedLayer a] }   
 
-trainSample :: (Show a, Numeric a, Num a, Num (Vector a)) =>
-  a -> (Vector a, Vector a) -> Network a -> Network a
-trainSample rate (testInp, testOut) net =
-  let sLr   = sensorLayer testInp
-      pNet  = propagateNetwork sLr net
-      bpNet = backPropNetwork testOut pNet
-      in updateNetwork rate bpNet
+instance (Show a, Element a) => Show (PropedNetwork a) where
+  show = (++) "Propagated Network\n" . showLayers . pnLs
 
-trainSamples :: (Show a, Numeric a, Num a, Num (Vector a)) =>
-  a -> [(Vector a, Vector a)] -> Network a -> Network a
-trainSamples rate samples net = last $ scanl (flip (trainSample rate)) net samples 
+propLayer :: Numeric a => PropedLayer a -> Layer a -> PropedLayer a
+propLayer pLr lr =
+  let lrInp  = plOutput pLr
+      lrWs   = lWs lr
+      lrAS   = lAS lr
+      lrSums = trans lrWs #> lrInp
+      lrOut  = mapVector (asFunc lrAS) lrSums
+      lrF's  = mapVector (asFunc' lrAS) lrSums 
+      in PropedLayer { plInput  = lrInp
+                     , plOutput = lrOut
+                     , plF's    = lrF's
+                     , plWs     = lrWs
+                     , plAS     = lrAS }
 
+propNetwork :: Numeric a => PropedLayer a -> Network a -> PropedNetwork a
+propNetwork sensorLr =
+  PropedNetwork . tail . scanl propLayer sensorLr . nLs 
 
-------------------------------------------------------------
--- Tests, examples ...
+-----------------------------------------------------
+-- Stage 3. Backward Propagation.
+data BackPropedLayer a =
+  BackPropedLayer { bplDeltas :: Vector a
+                  , bplGrad   :: Matrix a
+                  , bplWs     :: Matrix a
+                  , bplAS     :: ActivationSpec a }
+                  
+instance (Show a, Element a) => Show (BackPropedLayer a) where
+  show (BackPropedLayer ds grad ws as) =
+    "Error Deltas: "   ++ show ds   ++ "\n" ++
+    "Error Gradient: " ++ show grad ++ "\n" ++
+    "Weights:"         ++ show ws   ++ "\n" ++
+    "Activation: "     ++ show as
 
-runNet inp = pLayerOutput . last . pNetworkLayers . propagateNetwork (sensorLayer inp)
+newtype BackPropedNetwork a =
+  BackPropedNetwork { bpnLs :: [BackPropedLayer a] }
 
-type TrainSample = (Vector Double, Vector Double)
- 
-xorTest1 :: (Vector Double, Vector Double)
-xorTest1 = (2 |> [1, 1], 1 |> [0])
+instance (Show a, Element a) => Show (BackPropedNetwork a) where
+  show = (++) "Backpropagated Network\n" . showLayers . bpnLs
 
-xorTest2 :: (Vector Double, Vector Double)
-xorTest2 = (2 |> [1, 0], 1 |> [1])
+backPropOutputLayer :: (Storable a, Num a, Num (Vector a)) => PropedLayer a -> Vector a -> BackPropedLayer a
+backPropOutputLayer outputLayer desiredOutput =
+  let
+    lrWs   = plWs outputLayer
+    lrInp  = plInput outputLayer
+    lrOut  = plOutput outputLayer
+    lrF's  = plF's outputLayer
+    lrDs   = (lrOut - desiredOutput) * lrF's
+    lrGrad = errorGrad (rows lrWs, cols lrWs) lrInp lrDs
+    in BackPropedLayer { bplDeltas = lrDs
+                       , bplGrad   = lrGrad
+                       , bplWs     = lrWs
+                       , bplAS     = plAS outputLayer }
 
-xorTest3 :: (Vector Double, Vector Double)
-xorTest3 = (2 |> [0, 1], 1 |> [1])
+-- works as intended    
+errorGrad :: (Num a, Storable a) => (Int, Int) -> Vector a -> Vector a -> Matrix a
+errorGrad (r, c) input deltas =
+  let
+    lInp = toList input
+    lDs  = toList deltas
+    in (r><c) $ concatMap (zipWith (*) lDs . repeat) lInp
+    
+backPropHiddenLayer :: (Numeric a, Num a, Num (Vector a)) =>
+  PropedLayer a -> BackPropedLayer a -> BackPropedLayer a
+backPropHiddenLayer thisLayer nextLayer =
+  let nextLrWs   = bplWs nextLayer
+      nextLrDs   = bplDeltas nextLayer
+      thisLrF's  = plF's thisLayer
+      thisLrDs   = (nextLrWs #> nextLrDs) * thisLrF's
+      thisLrWs   = plWs thisLayer
+      thisLrInp  = plInput thisLayer
+      thisLrGrad = errorGrad (rows thisLrWs, cols thisLrWs) thisLrInp thisLrDs
+      in BackPropedLayer { bplDeltas = thisLrDs
+                         , bplGrad   = thisLrGrad
+                         , bplWs     = thisLrWs
+                         , bplAS     = plAS thisLayer }
+                         
+backPropNetwork :: (Numeric a, Num a, Num (Vector a)) =>
+  Vector a -> PropedNetwork a -> BackPropedNetwork a
+backPropNetwork desiredOutput propedNet =
+  let
+    netLs          = pnLs propedNet
+    lastBackProped = backPropOutputLayer (last netLs) desiredOutput
+    in BackPropedNetwork $ scanr backPropHiddenLayer lastBackProped $ init netLs 
 
-xorTest4 :: (Vector Double, Vector Double)
-xorTest4 = (2 |> [0, 0], 1 |> [0])
+-----------------------------------------------------
+-- Stage 4. Updating.
 
-xorSamples = [xorTest1, xorTest2, xorTest3, xorTest4]
+-- `Numeric` to infer `Container Vector a`
+updateLayer :: (Numeric a, Num a, Num (Vector a)) =>
+  a -> BackPropedLayer a -> Layer a
+updateLayer rate bpLr =
+  let
+    bpLrWs = bplWs bpLr
+    bpLrG  = bplGrad bpLr
+    lrWs   = bpLrWs - rate `scale` bpLrG
+    lrAS   = bplAS bpLr
+    in Layer lrWs lrAS
 
-xorNet = initNetwork (LayerArch 2) $
-  [LayerParams (LayerArch 6) 1 sigmoidActSpec
-  ,LayerParams (LayerArch 8) 1 sigmoidActSpec
-  ,LayerParams (LayerArch 1) 1 sigmoidActSpec]
+updateNetwork :: (Numeric a, Num a, Num (Vector a)) =>
+  a -> BackPropedNetwork a -> Network a
+updateNetwork rate = Network . map (updateLayer rate) . bpnLs
 
-------------------------------------------------------------
--- Network sample
+-----------------------------------------------------
+-- Stage 5. Utiles.
+
+runNetwork :: (Numeric a) => Vector a -> Network a -> Vector a
+runNetwork inp = plOutput . last . pnLs . propNetwork (SensorLayer inp) 
+
+-----------------------------------------------------
+-- Stage 5. Traning.
+
+type Sample a = (Vector a, Vector a)
+
+trainSample :: (Numeric a, Num a, Num (Vector a)) =>
+  a -> Sample a -> Network a -> (Vector a, Network a)
+trainSample rate (inp, out) net =
+  let
+    propedNet = propNetwork (SensorLayer inp) net
+    propedOut = plOutput $ last $ pnLs propedNet
+    backprNet = backPropNetwork out propedNet
+    in (out - propedOut, updateNetwork rate backprNet)
+
+trainSampleN :: (Numeric a, Num a, Num (Vector a)) =>
+  Int -> a -> Sample a -> Network a -> (Vector a, Network a)
+trainSampleN n rate sample = ntimes n goTrain . (,) 1
+  where
+    goTrain (_, net) = trainSample rate sample net
+    
+trainSamples :: (Numeric a, Num a, Num (Vector a)) =>
+  a -> [Sample a] -> Network a -> (Vector a, Network a)
+trainSamples rate samples net = 
+  foldl (\ (_, net) s -> trainSample rate s net) (1, net) samples  
+
+trainSamplesN :: (Numeric a, Num a, Num (Vector a)) =>
+  Int -> a -> [Sample a] -> Network a -> (Vector a, Network a)
+trainSamplesN n rate samples = ntimes n goTrain . (,) 1
+  where
+    goTrain (_, net) = trainSamples rate samples net
+
+-- Samples
+
+sigmoidAS :: Floating a => ActivationSpec a
+sigmoidAS =
+  ActivationSpec { asFunc  = sigmoid
+                 , asFunc' = sigmoid'
+                 , asDesc    = "Sigmoid" }
+                 
 sampleNetwork :: Network Double      
 sampleNetwork =
-  initNetwork (LayerArch 3) $
-    [LayerParams (LayerArch 5) 1 sigmoidActSpec
-    ,LayerParams (LayerArch 4) 2 sigmoidActSpec
-    ,LayerParams (LayerArch 3) 3 sigmoidActSpec]
-   
-getLayer net num = networkLayers net !! (num - 1) 
- 
+  initNetwork (LayerSize 2) $
+    [LayerParams (LayerSize 3) 1 sigmoidAS
+    ,LayerParams (LayerSize 2) 2 sigmoidAS
+    ,LayerParams (LayerSize 1) 3 sigmoidAS]
+    
+sampleLayer :: Layer Double
+sampleLayer = initLayer (LayerSize 3) $
+                LayerParams (LayerSize 5) 1 sigmoidAS
+    
+v1 :: Vector Double
+v1 = 3 |> [1,2,-1]
 
-sampleMatrix :: (Num a, Storable a) => Matrix a                
-sampleMatrix = (><) 4 3 $ repeat 1
+v2 :: Vector Double
+v2 = 2 |> [0.5, 0.3]
 
-sampleVector :: (Num a, Storable a) => Vector a
-sampleVector = (|>) 4 $ repeat 1
+---------------
+-- Digits
 
- 
-sensorLayerSample :: (Num a, Storable a) => PropagatedLayer a
-sensorLayerSample = SensorLayer $ 3 |> repeat 1
+type Digit = [[Int]]
+
+one1 = [ [0, 1, 0]
+       , [1, 1, 0]
+       , [0, 1, 0]
+       , [0, 1, 0]
+       , [0, 1, 0] ]
+      
+one2 = [ [0, 0, 1]
+       , [0, 1, 1]
+       , [0, 0, 1]
+       , [0, 0, 1]
+       , [0, 0, 1] ]
+      
+two = [ [0, 1, 0]
+      , [1, 0, 1]
+      , [0, 1, 0]
+      , [1, 0, 0]
+      , [1, 1, 1] ]
+      
+three = [ [1, 1, 0]
+        , [0, 0, 1]
+        , [0, 1, 0]
+        , [0, 0, 1]
+        , [1, 1, 0] ]
+
+digitSamples :: [Sample Double]
+digitSamples =
+  [(15 |> concat one1,  3 |> [1, 0, 0])
+  ,(15 |> concat one2,  3 |> [1, 0, 0])
+  ,(15 |> concat two,   3 |> [0, 1, 0])
+  ,(15 |> concat three, 3 |> [0, 0, 1])]
+
+digitNet :: Network Double
+digitNet = initNetwork (LayerSize 15) $
+  [LayerParams (LayerSize 3) 1 sigmoidAS]
+  
+--let net = trainSamplesN 1000 0.8 digitSamples digitNet
+
+---------------
+-- XOR
+
+
+xorSample1 :: Sample Double
+xorSample1 = (2 |> [1, 1], 1 |> [0])
+
+xorSample2 :: Sample Double
+xorSample2 = (2 |> [1, 0], 1 |> [1])
+
+xorSample3 :: Sample Double
+xorSample3 = (2 |> [0, 1], 1 |> [1])
+
+xorSample4 :: Sample Double
+xorSample4 = (2 |> [0, 0], 1 |> [0])
+
+xorSamples = [xorSample1, xorSample2, xorSample3]--, xorSample4]
+
+xorNet :: Network Double
+xorNet = initNetwork (LayerSize 2) $
+  [LayerParams (LayerSize 3) 1 sigmoidAS
+  ,LayerParams (LayerSize 1) 1 sigmoidAS]
+
+{-
+xorSample1 :: Sample Double
+xorSample1 = (2 |> [1, 1], 4 |> [1, 0, 0, 0])
+
+xorSample2 :: Sample Double
+xorSample2 = (2 |> [1, 0], 4 |> [0, 1, 0, 0])
+
+xorSample3 :: Sample Double
+xorSample3 = (2 |> [0, 1], 4 |> [0, 0, 1, 0])
+
+xorSample4 :: Sample Double
+xorSample4 = (2 |> [0, 0], 4 |> [0, 0, 0, 1])
+
+xorSamples = [xorSample1, xorSample2, xorSample3, xorSample4]
+
+xorNet :: Network Double
+xorNet = initNetwork (LayerSize 2) $
+  [LayerParams (LayerSize 4) 1 sigmoidAS]-}
